@@ -10,12 +10,19 @@ const allWork = (await getCollection('work', ({ data }) => !data.draft)).sort(
 ---
 
 <BaseLayout
-  title="Work"
-  description="Selected projects in product design and frontend engineering."
+  title="Projects"
+  description="A collection of things Aman Gupta has built while working with Rust, blockchain infrastructure, Ethereum, smart contracts and backend systems."
 >
   <section class="mx-auto max-w-3xl px-6 pt-16 pb-24 sm:pt-24">
-    <SectionHeading eyebrow="All work" count={allWork.length} />
-    <div>
+    <p class="text-ink-soft mb-6 font-mono text-xs tracking-[0.2em] uppercase">Work</p>
+    <h1 class="font-display text-ink max-w-2xl text-3xl font-medium sm:text-4xl">Projects</h1>
+    <p class="text-ink-soft mt-5 max-w-2xl">
+      A collection of things I've built while working with Rust, blockchain infrastructure,
+      Ethereum, smart contracts and backend systems.
+    </p>
+
+    <div class="mt-10">
+      <SectionHeading eyebrow="All projects" count={allWork.length} />
       {allWork.map((entry) => <WorkRow entry={entry} />)}
     </div>
   </section>

@@ -8,65 +8,130 @@ import { SITE } from '@/site.config';
 
 const allWork = await getCollection('work', ({ data }) => !data.draft);
 const sorted = [...allWork].sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
-const featured = sorted.filter((entry) => entry.data.featured);
-const rest = sorted.filter((entry) => !entry.data.featured);
-const selected = [...featured, ...rest].slice(0, 5);
+const featured = sorted.filter((entry) => entry.data.featured).slice(0, 4);
+
+const skillGroups = [
+  {
+    title: 'Rust / Backend',
+    items: ['Rust', 'Tokio', 'Tonic / gRPC', 'Async programming', 'Concurrency', 'PostgreSQL', 'REST APIs', 'Networking', 'Docker'],
+  },
+  {
+    title: 'Blockchain',
+    items: ['Ethereum', 'Solidity', 'Blockchain infrastructure', 'RPC systems', 'Indexing', 'DeFi', 'Aptos / Move'],
+  },
+  {
+    title: 'Systems / Security',
+    items: ['Distributed systems', 'Cryptography', 'Zero-knowledge proofs', 'Event-driven systems', 'Transaction processing'],
+  },
+];
+
+const experience = [
+  {
+    company: 'Supra',
+    role: 'Blockchain Engineer',
+    points: [
+      'Production blockchain infrastructure in Rust',
+      'Indexing services',
+      'RPC systems',
+      'Asynchronous backend services',
+      'gRPC / Tonic',
+      'PostgreSQL',
+      'Distributed systems / networking / observability',
+    ],
+  },
+  {
+    company: 'AVEX',
+    role: 'DeFi / Smart Contracts',
+    points: [
+      'DeFi and smart contract development',
+      'Move / Aptos',
+      'DEX, liquidity and lending related workflows',
+    ],
+  },
+];
 ---
 
 <BaseLayout title={SITE.name}>
-  <section class="mx-auto max-w-3xl px-6 pt-16 pb-20 sm:pt-24">
-    <p class="text-ink-soft mb-6 inline-flex items-center gap-2 font-mono text-xs">
+  <section class="mx-auto max-w-3xl px-6 pt-16 pb-18 sm:pt-24">
+    <p class="text-ink-soft mb-4 inline-flex items-center gap-2 font-mono text-xs">
       <span class="bg-signal h-1.5 w-1.5 rounded-full" aria-hidden="true"></span>
       {SITE.status}
     </p>
+
+    <p class="text-ink-soft mb-5 font-mono text-xs tracking-[0.2em] uppercase">{SITE.name}</p>
 
     <h1 class="font-display text-ink max-w-2xl text-4xl leading-[1.1] font-medium sm:text-5xl">
       {SITE.tagline}
     </h1>
 
-    <p class="text-ink-soft mt-6 max-w-md">
-      {SITE.role} — based on the work below, not a list of buzzwords.
+    <p class="text-ink-soft mt-6 max-w-2xl">
+      I'm a backend and blockchain engineer. At Supra I've worked on production blockchain
+      infrastructure in Rust, including indexing services, RPC systems and asynchronous backend
+      services. Outside of work I build projects around Ethereum, Solidity, cryptography and
+      distributed systems.
     </p>
 
+    <p class="text-ink-soft mt-4 font-mono text-xs">{SITE.location}</p>
+
     <div class="mt-8 flex flex-wrap items-center gap-3">
-      <Button href="/work" variant="solid">View the work →</Button>
-      <Button href="#contact" variant="ghost">Say hello</Button>
+      {SITE.social.slice(0, 2).map((link) => <Button href={link.href} variant="ghost">{link.label}</Button>)}
+      <Button href={`mailto:${SITE.email}`} variant="ghost">Email</Button>
+    </div>
+  </section>
+
+  <section class="mx-auto max-w-3xl px-6 pb-20">
+    <SectionHeading eyebrow="What I work with" />
+    <div class="grid gap-6 sm:grid-cols-3">
+      {
+        skillGroups.map((group) => (
+          <div>
+            <h2 class="font-display text-ink mb-3 text-lg font-medium">{group.title}</h2>
+            <ul class="flex flex-wrap gap-2">
+              {group.items.map((item) => (
+                <li class="border-line text-ink-soft rounded-full border px-3 py-1 font-mono text-xs">
+                  {item}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="mx-auto max-w-3xl px-6 pb-20">
+    <SectionHeading eyebrow="Experience" />
+    <div class="space-y-8">
+      {
+        experience.map((item) => (
+          <section class="border-line border-b pb-8 last:border-b-0 last:pb-0">
+            <p class="text-ink-soft font-mono text-xs tracking-[0.2em] uppercase">{item.company}</p>
+            <h2 class="font-display text-ink mt-2 text-2xl font-medium">{item.role}</h2>
+            <ul class="text-ink-soft mt-4 grid gap-2 sm:grid-cols-2">
+              {item.points.map((point) => <li>{point}</li>)}
+            </ul>
+          </section>
+        ))
+      }
     </div>
   </section>
 
   <section id="work" class="mx-auto max-w-3xl px-6 pb-20">
-    <SectionHeading eyebrow="Selected work" count={allWork.length} />
+    <SectionHeading eyebrow="Selected projects" count={featured.length} />
     <div>
-      {selected.map((entry) => <WorkRow entry={entry} />)}
+      {featured.map((entry) => <WorkRow entry={entry} />)}
     </div>
-    {
-      allWork.length > selected.length && (
-        <div class="mt-6">
-          <a
-            href="/work"
-            class="text-ink-soft hover:text-signal font-mono text-xs transition-colors"
-          >
-            View all {allWork.length} projects →
-          </a>
-        </div>
-      )
-    }
-  </section>
-
-  <section id="about" class="mx-auto max-w-3xl px-6 pb-20">
-    <SectionHeading eyebrow="About" />
-    <p class="text-ink-soft max-w-xl">
-      {SITE.description}
-    </p>
-    <a href="/about" class="text-signal mt-4 inline-block font-mono text-xs hover:underline">
-      More about how I work →
-    </a>
+    <div class="mt-6">
+      <a href="/work" class="text-ink-soft hover:text-signal font-mono text-xs transition-colors">
+        View all projects →
+      </a>
+    </div>
   </section>
 
   <section id="contact" class="mx-auto max-w-3xl px-6 pb-24">
-    <SectionHeading eyebrow="Let's talk" />
+    <SectionHeading eyebrow="Contact" />
     <p class="font-display text-ink max-w-lg text-2xl sm:text-3xl">
-      Have something worth building?
+      Looking for an engineer for a backend, Rust or blockchain project?
     </p>
     <a
       href={`mailto:${SITE.email}`}

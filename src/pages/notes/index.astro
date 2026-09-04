@@ -1,0 +1,53 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import SectionHeading from '@/components/SectionHeading.astro';
+import { formatDate } from '@/utils/formatDate';
+
+const notes = (await getCollection('notes', ({ data }) => !data.draft)).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf(),
+);
+---
+
+<BaseLayout
+  title="Notes"
+  description="Technical notes from Aman Gupta on Rust, backend systems, blockchain infrastructure and distributed systems."
+>
+  <section class="mx-auto max-w-3xl px-6 pt-16 pb-24 sm:pt-24">
+    <p class="text-ink-soft mb-6 font-mono text-xs tracking-[0.2em] uppercase">Notes</p>
+    <h1 class="font-display text-ink max-w-2xl text-3xl font-medium sm:text-4xl">Notes</h1>
+    <p class="text-ink-soft mt-5 max-w-2xl">
+      Lightweight technical writing on Rust, backend systems, blockchain infrastructure and things I
+      learn while building.
+    </p>
+
+    <div class="mt-10">
+      <SectionHeading eyebrow="Recent notes" count={notes.length} />
+      {
+        notes.length > 0 ? (
+          notes.map((note) => (
+            <a
+              href={`/notes/${note.id}`}
+              class="group border-line hover:border-signal grid grid-cols-[5.5rem_1fr_auto] items-center gap-4 border-b py-5 transition-colors sm:gap-6"
+            >
+              <span class="text-ink-soft font-mono text-xs">
+                {note.data.dateLabel ?? formatDate(note.data.date, 'compact')}
+              </span>
+              <span class="min-w-0">
+                <span class="font-display text-ink group-hover:text-signal block truncate text-lg transition-colors">
+                  {note.data.title}
+                </span>
+                <span class="text-ink-soft hidden truncate text-sm sm:block">{note.data.summary}</span>
+              </span>
+              <span aria-hidden="true" class="text-ink-soft group-hover:text-signal transition-all group-hover:translate-x-1">
+                →
+              </span>
+            </a>
+          ))
+        ) : (
+          <p class="text-ink-soft">Notes will live here as I write them.</p>
+        )
+      }
+    </div>
+  </section>
+</BaseLayout>
