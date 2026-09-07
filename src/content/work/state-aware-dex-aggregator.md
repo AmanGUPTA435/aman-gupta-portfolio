@@ -1,209 +1,228 @@
 ---
-title: How a DEX Aggregator Works
-summary: A practical look at building a DEX routing system, from pool state and graph-based route discovery to state-aware split allocation and atomic on-chain execution.
+title: DEX Aggregator
+summary: A Rust and Solidity DEX routing engine that discovers multi-hop swap paths, models shared pool state, allocates swaps across competing routes, and executes the resulting plan atomically on-chain.
+role: Independent Project
 date: 2026-09-08
-dateLabel: Technical Note
-tags: [Ethereum, DEX, DeFi, Solidity, Rust, AMM, Routing, Blockchain, Backend]
+dateLabel: Ongoing
+tags: [Rust, Solidity, Ethereum, DeFi, DEX, AMM, Routing, Alloy, Foundry, Tokio, Blockchain]
+featured: true
 draft: false
 ---
 
-When I started building this DEX aggregator, I wanted to understand the part of a swap system that sits between "there are several liquidity pools" and "which transaction should actually be executed?"
+I am building this project to understand the engineering behind a DEX aggregator rather than treating routing as a simple "find the pool with the best price" problem.
 
-A simple swap can use one pool directly. An aggregator has a harder problem: given an input token, an output token and an amount, there may be several possible paths through the available liquidity.
+The system has two main parts. A Rust routing engine discovers candidate swap paths, synchronizes pool reserves from the blockchain, simulates competing allocations against mutable pool state, and turns the selected plan into ABI-encoded execution steps. A Solidity execution layer then validates the targets and executes the complete plan in one transaction.
 
-The interesting part is that the best route is not necessarily the route with the best quote at the beginning. Swapping through a pool changes its reserves, so routes that share liquidity can affect one another.
+The most interesting part of the project is the interaction between route selection and changing liquidity. Two apparently independent routes can share a downstream pool, so consuming liquidity on one route changes the price available to the other. The current implementation models that shared state explicitly and uses it during split allocation.
 
-That led me to structure the project around three separate concerns: route discovery, state-aware simulation and execution.
+## What I Wanted to Build
 
-## The basic flow
-
-A useful mental model is:
+The basic problem is:
 
 ```text
-Blockchain / RPC
-       |
-       | pool addresses + reserves
-       v
-Pool State
-       |
-       v
-Token Graph
-       |
-       +--------------------+
-       |                    |
-       v                    v
-Route Discovery       Route Dependencies
-       |                    |
-       +---------+----------+
-                 |
-                 v
-        State-aware Simulation
-                 |
-                 v
-          Split Allocation
-                 |
-                 v
-         Ordered Execution Plan
-                 |
-                 v
-          ABI-encoded Calls
-                 |
-                 v
-        Solidity Aggregator
-                 |
-                 v
-       Atomic On-chain Swap
-                 |
-                 v
-        Actual Output Token
+Given:
+    input token
+    output token
+    input amount
+
+Find:
+    one or more useful swap routes
+    an allocation across those routes
+    an execution order
+
+Such that:
+    simulated output is high
+    shared pool state is respected
+    the resulting plan can be executed atomically on-chain
 ```
 
-The project is split between a Rust routing engine and a Solidity execution layer.
+A single-path router can quote a route against the current reserves and stop there. A split router has a harder problem because each executed swap changes the reserves that later swaps depend on.
 
-Rust handles the off-chain intelligence: loading state, constructing the graph, finding routes, quoting swaps, simulating reserve changes and deciding how the input should be allocated.
+This project is structured around that problem.
 
-Solidity handles the on-chain part: accepting the input tokens, executing approved pool calls and returning the final output atomically.
+## Architecture
 
-## 1. Start with liquidity pools, not with routes
-
-The first thing the router needs is a representation of the available pools.
-
-The test environment contains four AMMs:
+The current architecture is split between an off-chain Rust engine and a Solidity execution layer.
 
 ```text
-AMM1: Token A / Token B
-AMM2: Token A / Token B
-AMM3: Token A / Token C
-AMM4: Token B / Token C
+                         Blockchain / RPC
+                               |
+                         read pool state
+                               |
+                               v
+                     +---------------------+
+                     | Rust Routing Engine  |
+                     +---------------------+
+                               |
+                +--------------+--------------+
+                |                             |
+                v                             v
+          Token / pool graph          Pool synchronization
+                |                             |
+                +--------------+--------------+
+                               v
+                    Candidate route discovery
+                               |
+                               v
+                    Route dependency graph
+                               |
+                               v
+                  State-aware split allocation
+                         + simulation
+                               |
+                               v
+                      Ordered execution plan
+                               |
+                               v
+                       ABI calldata builder
+                               |
+                               v
+                  +-------------------------+
+                  | Solidity QuoteAggregator|
+                  +-------------------------+
+                               |
+                         approved pools
+                               |
+                               v
+                     Atomic multi-hop swaps
+                               |
+                               v
+                          Final output
 ```
 
-This gives the system several ways to move from A to C:
+The Rust side is responsible for routing intelligence. The Solidity side is deliberately generic: it receives encoded execution steps and performs them against approved pool contracts.
+
+## Rust Module Structure
 
 ```text
-A → C
-A → B → C
-A → B → C
+aggregator/src/
+├── cli.rs
+├── constants.rs
+├── contracts.rs
+├── execute.rs
+├── graph.rs
+├── lib.rs
+├── main.rs
+├── quote.rs
+├── scoring.rs
+├── simulation.rs
+├── state.rs
+└── types.rs
 ```
 
-The two A → B → C routes are especially interesting because they use different A/B pools but share the same B/C pool.
+The main responsibilities are:
 
-That shared pool becomes important later when deciding how to split a large trade.
+| Module | Responsibility |
+|---|---|
+| `cli.rs` | CLI arguments, RPC configuration and environment address helpers |
+| `constants.rs` | Router gas constants |
+| `contracts.rs` | Alloy-generated Solidity bindings |
+| `types.rs` | Pools, graph edges, routes and execution-plan types |
+| `state.rs` | Read and synchronize pool reserves from the chain |
+| `graph.rs` | Token graph construction, bounded route discovery and route dependencies |
+| `quote.rs` | AMM quote calculations |
+| `scoring.rs` | Route score calculation using output value and gas cost |
+| `simulation.rs` | Mutable pool-state simulation and split allocation |
+| `execute.rs` | Execution-step creation, ABI encoding and transaction submission |
+| `main.rs` | End-to-end orchestration |
 
-## 2. Pool state has to be synchronized with the chain
+## 1. Load Pool State From the Chain
 
-The Rust router does not assume that its local reserve values are current.
+The aggregator starts from a set of configured AMM pool addresses.
 
-For every configured pool, it reads:
+For each pool, the Rust service reads:
 
 ```text
-tokenA
-tokenB
-reserveA
-reserveB
-```
-
-The state synchronization step refreshes every edge in the candidate routes from the on-chain pool.
-
-Conceptually:
-
-```text
-Pool address
+pool address
     |
     +--> tokenA()
     +--> tokenB()
     +--> getReserves()
-    |
-    v
-Local Edge State
 ```
 
-This gives the router a snapshot of the liquidity it is about to reason about.
+The resulting data is represented locally as:
 
-The important distinction is that this is an off-chain model of on-chain state. The final transaction is still the source of truth.
+```rust
+pub struct Pool {
+    pub address: Address,
+    pub token_a: Address,
+    pub token_b: Address,
+    pub reserve_a: U256,
+    pub reserve_b: U256,
+}
+```
 
-## 3. Represent the DEX as a token graph
+Route edges then store reserves from the perspective of the direction in which the swap is being considered.
 
-Once pool state is available, the router turns the pools into a graph.
-
-A pool between A and B becomes two directed edges:
+For example, a pool containing `A/B` becomes two graph edges:
 
 ```text
-A ─────────► B
-B ◄───────── A
+A -> B
+B -> A
 ```
 
-Each edge stores:
+The same physical pool therefore supports both swap directions while retaining the correct input-side and output-side reserves.
+
+## 2. Build a Token Graph
+
+Once the pool data is available, the router constructs a token graph where tokens are nodes and pools are directed swap edges.
+
+For example:
 
 ```text
-token_in
-token_out
-pool
-reserve_in
-reserve_out
+          AMM1
+      A ---------> B
+      |             |
+  AMM3|             |AMM4
+      |             |
+      v             v
+      C <-----------
 ```
 
-This makes the routing problem a graph-search problem rather than a collection of hard-coded swap combinations.
-
-For the current topology:
+The current local topology contains:
 
 ```text
-        AMM1
-   A ────────── B
-   │            │
-   │ AMM2       │ AMM4
-   │            │
-   └────────────┘
-   │
-   │ AMM3
-   ▼
-   C
+AMM1: A / B
+AMM2: A / B
+AMM3: A / C
+AMM4: B / C
 ```
 
-The actual graph contains directed edges for both swap directions.
+This intentionally creates multiple ways to reach the same destination.
 
-## 4. Candidate routes are discovered with bounded DFS
+## 3. Discover Candidate Routes With Bounded DFS
 
-The router uses depth-first search to discover possible paths from the input token to the output token.
+Candidate paths are discovered using depth-first search with a visited-token set and a hop limit.
 
-The search keeps:
+The current router allows up to three hops.
+
+For the test topology, that produces routes such as:
 
 ```text
-current token
-current path
-visited tokens
-maximum hop count
-current amount
+Route 0:
+A -> B -> C
+AMM1     AMM4
+
+Route 1:
+A -> B -> C
+AMM2     AMM4
+
+Route 2:
+A -> C
+AMM3
 ```
 
-The current implementation limits the search to three hops.
+The important distinction is that Route 0 and Route 1 have the same token path but use different liquidity for the first hop.
 
-A simplified search looks like:
+They are therefore different routes from the allocator's perspective.
 
-```text
-A
-|
-+--> B
-|    |
-|    +--> C
-|
-+--> C
-```
+The route search also carries the current amount through the path, so later hops can be quoted using the output of the previous hop.
 
-The visited-token set prevents cycles such as:
+## 4. Quote Each Route Using the AMM Invariant
 
-```text
-A → B → A → C
-```
+The current test AMM uses a constant-product style formula with a 0.3% swap fee.
 
-from becoming candidate routes.
-
-The result is a collection of `Route` values containing their ordered pool edges and the quoted output.
-
-## 5. Quote each hop using the AMM invariant
-
-The test AMM uses a constant-product style pricing formula with a 0.3% fee.
-
-The calculation is:
+The quote calculation is:
 
 ```text
 amountInWithFee = amountIn × 997
@@ -214,226 +233,190 @@ amountOut =
     (reserveIn × 1000 + amountInWithFee)
 ```
 
-For a multi-hop route, the output of one pool becomes the input to the next:
+A multi-hop quote is evaluated one hop at a time:
 
 ```text
-A → B
-    |
-    v
-amount B
-    |
-    v
-B → C
-    |
-    v
-amount C
+A -> B
+     |
+     | output becomes next input
+     v
+B -> C
+     |
+     v
+final C output
 ```
 
-The router therefore does not simply add independent prices together. It propagates the actual amount through every hop.
+The important part is that the output of one hop is not just a display value. It becomes the exact simulated input for the next hop.
 
-## 6. Why the first quote is not enough
+## 5. Synchronize Route Reserves With the Current Chain State
 
-One of the main things I wanted this project to handle was the effect of a trade on shared liquidity.
+Routes are first discovered from the configured pool topology, but the aggregator does not rely on the reserves that were present when the graph was created.
 
-Imagine:
+Before allocation, it refreshes the relevant pool state from the blockchain:
 
 ```text
-Route 0:
-A → B using AMM1
-B → C using AMM4
-
-Route 1:
-A → B using AMM2
-B → C using AMM4
+candidate routes
+      |
+      v
+read getReserves()
+      |
+      v
+rebuild directional edge reserves
+      |
+      v
+state synchronized with chain
 ```
 
-At the beginning, both routes can quote against the same AMM4 reserves.
+This gives the simulator a concrete starting state for the current transaction attempt.
 
-But after executing part of Route 0:
+## 6. Model Shared Liquidity Explicitly
+
+This is the core part of the project.
+
+Consider:
 
 ```text
-AMM4 reserves
-    |
-    v
-changed
+Route 0: A -> B via AMM1 -> B -> C via AMM4
+Route 1: A -> B via AMM2 -> B -> C via AMM4
 ```
 
-Route 1 no longer has the same price.
+Both routes use `AMM4` for the final hop.
 
-A router that evaluates every route independently against the original reserves can therefore produce a split that looks good on paper but is inconsistent with the state created by its own earlier allocations.
-
-This is why the project has a separate simulation layer.
-
-## 7. Build a route-dependency graph
-
-After candidate routes are discovered, the router builds another graph: this time between routes.
-
-Two routes are connected when they use the same pool.
-
-For example:
+A naive split allocator might quote Route 0 and Route 1 independently against the same original `B/C` reserves:
 
 ```text
-Route 0 ───── Route 1
-   \             /
-    \           /
-      shared AMM4
+original AMM4 state
+      |
+      +--> quote Route 0
+      |
+      +--> quote Route 1
 ```
 
-This dependency graph makes the relationship between candidate routes explicit.
+That is not what happens during execution. Once Route 0 consumes liquidity from AMM4, the reserves seen by Route 1 have changed.
 
-It also gives the system a way to reason about liquidity contention instead of treating every route as independent.
+This project therefore keeps a mutable simulated state and updates every route's view of a shared pool after each simulated swap.
 
-## 8. Simulate swaps against mutable local state
+## 7. Simulate Candidate Allocations Against Mutable State
 
-The router keeps a mutable copy of the synchronized route state.
+The allocator processes the input amount in fixed-size chunks.
 
-When a simulated swap happens:
+For every chunk, it evaluates each candidate route from the same current state.
+
+Conceptually:
 
 ```text
-tokenIn → tokenOut
+Current state S0
+      |
+      +---- candidate Route 0 ----> S0'
+      |
+      +---- candidate Route 1 ----> S0''
+      |
+      +---- candidate Route 2 ----> S0'''
+      |
+      v
+ choose best candidate
+      |
+      v
+ commit winning state S1
 ```
 
-the corresponding reserves are updated:
+Each candidate starts from a clone of the current state.
+
+That matters because a candidate route represents a hypothetical choice. Testing Route 0 must not permanently modify the state before Route 1 is evaluated.
+
+Only the winning candidate state is committed for the next chunk.
+
+For a simulated swap:
 
 ```text
 reserveIn  += amountIn
 reserveOut -= amountOut
 ```
 
-The reverse-direction view of the same physical pool is updated too.
+The reverse directional edge for the same physical pool is updated as well.
 
-That matters because the same pool can appear in multiple route edges.
-
-The simulation therefore acts like a small local model of how the pool graph would evolve as the trade is executed.
-
-## 9. Candidate simulations must start from the same current state
-
-Suppose the current simulated state is `S`.
-
-The router wants to compare several possible next chunks.
-
-It does not want this:
+So if one route changes a pool from:
 
 ```text
-S
- |
- +--> simulate Route 0 --> modified S
-                         |
-                         +--> simulate Route 1
+A -> B
 ```
 
-because Route 1 would accidentally be evaluated after Route 0's hypothetical changes.
-
-Instead, each candidate is evaluated from the same state:
+the corresponding:
 
 ```text
-                 S
-          _______|_______
-         /       |       \
-        v        v        v
-   Route 0    Route 1   Route 2
-      |          |         |
-     S0         S1        S2
-         \       |       /
-             compare
-                |
-                v
-          choose winner
-                |
-                v
-          commit state
+B -> A
 ```
 
-The implementation achieves this by cloning the current simulated route state for each candidate.
+view sees the same underlying reserve change.
 
-Only the winning candidate state becomes the next state.
+## 8. Greedy Split Allocation
 
-## 10. Large trades can be split across routes
+The current allocator is intentionally simple and explicit rather than pretending to be a globally optimal optimizer.
 
-The current allocator does not force the entire input amount through one route.
+The input is divided into chunks:
 
-Instead, it processes the input in chunks.
+```text
+amountIn
+  |
+  +--> chunk 1
+  +--> chunk 2
+  +--> chunk 3
+  +--> ...
+```
+
+For each chunk, every route is simulated and the route producing the best incremental output is selected.
+
+The result contains both total allocation and execution order.
 
 For example:
 
 ```text
-Input = 100
+Allocations
+-----------
+Route 0: 30
+Route 1: 50
+Route 2: 20
 
-chunk size = 10
-
-10 → best route
-10 → best route
-10 → best route
+Execution plan
+--------------
+Route 1 / 10
+Route 0 / 10
+Route 1 / 10
+Route 2 / 10
 ...
 ```
 
-After every chunk, the simulated pool state changes.
+The order is important because the first swap changes the state used to evaluate later swaps.
 
-That means the best route can change during the same transaction.
+The current implementation therefore treats allocation and execution ordering as related problems rather than producing a split and then arbitrarily executing it.
+
+The tradeoff is that the current chunk-based greedy algorithm does not guarantee a globally optimal allocation across all routes.
+
+## 9. Route Scoring and Gas Model
+
+The router also calculates a simple route score based on expected output value minus an estimated gas cost.
 
 Conceptually:
 
 ```text
-Initial state
-    |
-    +--> Route 0 is best
-    |
-    v
-state changes
-    |
-    +--> Route 1 becomes best
-    |
-    v
-state changes
-    |
-    +--> Route 0 becomes best again
+output value in USD
+        -
+gas estimate × gas price × native-token price
+        =
+route score
 ```
 
-The current allocator is intentionally greedy: for every chunk it chooses the candidate producing the highest simulated total output.
+The current implementation uses coarse constants for router and hop gas costs and fixed example prices in the local test setup.
 
-It is therefore a state-aware allocator, but not yet a globally optimal optimizer.
+The score is useful as part of the routing model, but the current split allocator selects candidates by simulated incremental output rather than using the score as its complete optimization objective.
 
-## 11. The execution order is part of the result
+This is one of the areas intended for further development.
 
-A split allocation alone is not enough.
+## 10. Turn the Plan Into ABI-Encoded Execution Steps
 
-These two plans can have the same allocations:
+After allocation, the Rust engine replays the chosen execution order against the simulated state and constructs Solidity execution objects.
 
-```text
-Route 0: 50
-Route 1: 50
-```
-
-but different execution orders:
-
-```text
-Plan A:
-Route 0 / 50
-Route 1 / 50
-
-Plan B:
-Route 1 / 50
-Route 0 / 50
-```
-
-Because the routes can share pools, the order can change the reserves seen by later swaps.
-
-The allocator therefore produces an explicit `RouteExecution` sequence:
-
-```rust
-pub struct RouteExecution {
-    pub route_index: usize,
-    pub amount_in: U256,
-}
-```
-
-This sequence is later replayed when constructing the actual transaction.
-
-## 12. Turn the plan into generic execution calls
-
-Once the Rust side has decided what should happen, it needs to express that plan in a form the Solidity contract can execute.
-
-The Solidity aggregator uses:
+The execution type is:
 
 ```solidity
 struct Execution {
@@ -444,63 +427,29 @@ struct Execution {
 }
 ```
 
-For every route hop, Rust creates the AMM swap calldata.
+For each hop, Rust constructs the AMM swap call and ABI-encodes it with Alloy:
 
-Conceptually:
+```rust
+let call = AMMPool::swapCall {
+    tokenIn: edge.token_in,
+    amountIn: hop_amount_in,
+    minAmountOut: min_amount_out,
+};
 
-```text
-RouteExecution
-      |
-      v
-Route edges
-      |
-      v
-quote each hop
-      |
-      v
-AMMPool::swap(...)
-      |
-      v
-ABI encode
-      |
-      v
-Execution[]
+let data = call.abi_encode();
 ```
 
-The execution layer therefore does not need to understand the router's graph algorithms.
+The execution builder uses the same simulated state transitions as the allocator while generating the final call sequence.
 
-It receives a sequence of generic calls.
+That means the calldata is created for the exact order that the simulator selected.
 
-## 13. The pool registry creates an execution boundary
+## 11. Generic Solidity Execution Layer
 
-The Solidity `QuoteAggregator` does not allow arbitrary addresses to be used as execution targets.
+The Solidity contract is intentionally separated from the routing algorithm.
 
-Before a call is made, the target must be approved by `PoolRegistry`.
+`QuoteAggregator` accepts a sequence of generic execution steps rather than requiring the Rust router to know about a specific DEX implementation.
 
-The model is:
-
-```text
-Execution target
-      |
-      v
-PoolRegistry
-      |
-   approved?
-    /     \
-  yes      no
-   |        |
- execute   revert
-```
-
-This separates routing decisions from the question of which contracts are trusted execution targets.
-
-The current registry is intentionally simple and owner-controlled.
-
-## 14. Atomic execution happens in Solidity
-
-The final swap is executed through one call to `QuoteAggregator.execute`.
-
-The high-level flow is:
+The flow is:
 
 ```text
 Trader
@@ -520,301 +469,435 @@ Execution 2
 Execution N
   |
   v
-measure token-out balance
+final output token
   |
   v
-transfer output to trader
+Trader
 ```
 
-If one of the execution steps reverts, the transaction reverts.
+For every step, the contract:
 
-That gives the off-chain routing engine a clean boundary:
+1. checks that the target pool is approved by the registry
+2. checks basic execution arguments
+3. approves the target to spend the input token
+4. performs the encoded low-level call
+5. clears the approval
+6. emits an execution event
+
+The executor measures the final token balance change and then checks it against the transaction-level minimum output.
+
+## 12. Pool Registry as an Execution Trust Boundary
+
+The project keeps pool authorization separate from swap execution.
+
+`PoolRegistry` maintains a mapping of approved pool addresses:
 
 ```text
-Rust
+PoolRegistry
     |
-    | decide + simulate + encode
-    v
-Solidity
-    |
-    | execute atomically
-    v
-EVM
+    +--> AMM1 approved
+    +--> AMM2 approved
+    +--> AMM3 approved
+    +--> AMM4 approved
 ```
 
-## 15. Slippage protects the final result
+The execution contract refuses to call a target that is not approved by the registry.
 
-The transaction includes a minimum acceptable final output.
-
-The current prototype uses a 1% transaction-level slippage tolerance:
+This creates a small explicit trust boundary between:
 
 ```text
-amountOutMin =
-    simulatedOutput × 99 / 100
+routing decision
+       |
+       v
+encoded execution target
+       |
+       v
+registry validation
+       |
+       v
+actual external call
 ```
 
-The execution builder currently also uses the simulated output as the per-hop minimum output while validating the prototype.
+The current project uses a manually configured registry. A more complete system could evolve this toward a richer adapter or factory/discovery model.
 
-That is intentionally strict for the current correctness test.
+## 13. On-Chain Quote Support
 
-A more production-oriented implementation would use a more deliberate per-hop slippage policy and account for execution-time state changes.
+The Solidity execution contract also contains quote functions that evaluate a supplied path against the current pool reserves.
 
-## 16. Simulation is checked against real execution
-
-One of the most useful parts of the project is that the Rust simulator is not treated as correct simply because the math looks right.
-
-The program records the trader's output-token balance before execution:
+The quote API accepts:
 
 ```text
-balanceBefore
+input token
+output token
+input amount
+paths
+pools
 ```
 
-then submits the atomic transaction and reads it again:
+and can return the best final output across the supplied candidate paths.
+
+A route quote also returns the intermediate amounts for every hop:
 
 ```text
-balanceAfter
-```
-
-The actual output is:
-
-```text
-actualOutput =
-    balanceAfter - balanceBefore
-```
-
-The program then compares:
-
-```text
-simulated output
-        vs
-actual output
-```
-
-For the tested setup, the result was:
-
-```text
-Simulated output: 552782643753440975662
-Actual output:    552782643753440975662
-
-Perfect match:
-simulation == on-chain execution.
-```
-
-That was an important validation milestone because it tested the complete chain:
-
-```text
-pool state
+amountIn
    |
-route discovery
+   v
+hop 1 output
    |
-quoting
+   v
+hop 2 output
    |
-allocation
-   |
-state simulation
-   |
-calldata construction
-   |
-Solidity execution
-   |
-actual reserves
-   |
-final output
+   v
+final amountOut
 ```
 
-## 17. Rust and Solidity have deliberately different responsibilities
+The main routing pipeline currently performs the more sophisticated route discovery and split simulation off-chain in Rust.
 
-The architecture is easier to reason about when the responsibilities stay separated.
+## 14. Transaction-Level Slippage
 
-### Rust
+The current prototype applies a 1% minimum-output tolerance at the final transaction level.
+
+The simulated final output is converted into:
 
 ```text
-CLI
- |
- v
-Load pools
- |
- v
-Build graph
- |
- v
-Find routes
- |
- v
-Synchronize state
- |
- v
-Build dependencies
- |
- v
-Score routes
- |
- v
-Allocate input
- |
- v
-Build execution calls
+amountOutMin = simulatedOutput × 99 / 100
 ```
 
-### Solidity
+For the first correctness-focused execution path, individual AMM calls use the simulated hop output as their `minAmountOut`.
 
-```text
-Receive input
- |
- v
-Validate execution target
- |
- v
-Approve pool for exact amount
- |
- v
-Call pool
- |
- v
-Repeat
- |
- v
-Measure output
- |
- v
-Slippage check
- |
- v
-Transfer output
-```
+That is intentionally strict and useful for testing simulation correctness, but it is not yet a complete production slippage policy.
 
-Rust is therefore responsible for optimization and planning, while Solidity is responsible for enforcing the execution plan on-chain.
+A production router would need a more deliberate treatment of per-hop tolerances, transaction-level protection, stale state and execution-time price movement.
 
-## 18. Route scoring also accounts for gas
+## 15. Atomic Multi-Hop Execution
 
-The project contains a route scoring layer that converts the expected output and estimated gas cost into a simple score.
+The complete plan is submitted as one call to `QuoteAggregator.execute`.
 
 Conceptually:
 
 ```text
-route score =
-    output value in USD
-    -
-    estimated gas cost in USD
-```
-
-The current prototype uses simplified values for:
-
-```text
-token-out USD price
-native-token USD price
-gas price
-```
-
-and estimates gas from:
-
-```text
-base router gas
-+
-swap-hop gas × number of hops
-```
-
-This is useful as a starting point because a route with slightly more output is not necessarily better if its execution cost is significantly higher.
-
-The current model is deliberately approximate rather than a production gas estimator.
-
-## 19. The project is also an exercise in state modeling
-
-The part I found most interesting is that the router is not simply a graph algorithm.
-
-It is a graph algorithm operating over mutable financial state.
-
-The system effectively works with:
-
-```text
-Graph
- +
-Pool state
- +
-Trade amount
- +
-Execution order
- =
-Expected outcome
-```
-
-Changing any of these can change the optimal route.
-
-That is why the project separates:
-
-```text
-static topology
-```
-
-from:
-
-```text
-dynamic liquidity state
-```
-
-The graph tells the router what is possible.
-
-The state tells it what is currently attractive.
-
-## 20. What I think about when building a router now
-
-The implementation details will change as the system grows, but the questions are fairly stable.
-
-### What routes are actually possible?
-
-The graph needs to represent all usable pools without allowing unnecessary cycles.
-
-### What state are the quotes based on?
-
-A quote is only meaningful relative to a particular reserve state.
-
-### Which routes share liquidity?
-
-Two routes that look independent at the token level may still compete for the same physical pool.
-
-### Does allocation change future prices?
-
-If yes, the optimizer cannot evaluate every route only once.
-
-### Does execution order matter?
-
-If routes share pools, it usually does.
-
-### Can the execution layer enforce the plan?
-
-The Solidity contract needs to validate targets and enforce minimum output conditions.
-
-### Can the simulator be tested against reality?
-
-Comparing predicted output with actual on-chain output is one of the strongest correctness checks available for this kind of system.
-
-## What I learned
-
-The main thing I took away from building this project is that DEX aggregation is not just "find the path with the best price."
-
-The harder problem is:
-
-```text
-multiple routes
+execution plan
       |
       v
-shared liquidity
+one Solidity call
+      |
+      +--> swap 1
+      +--> swap 2
+      +--> swap 3
+      +--> ...
       |
       v
-state changes
-      |
-      v
-changing prices
-      |
-      v
-allocation + ordering
-      |
-      v
-atomic execution
+final output check
 ```
 
-Building the project gave me hands-on experience with graph-based routing, AMM mathematics, Ethereum contract interaction, mutable state simulation, ABI encoding and multi-step atomic execution.
+Because the steps are performed inside the same EVM transaction, a failing step reverts the transaction rather than leaving a partially executed route.
 
-It also reinforced a broader backend engineering idea: when a system makes decisions against changing state, the model used for planning needs to account for the state transitions caused by its own decisions.
+The Rust side then checks the trader's token-out balance before and after the transaction to calculate the actual received amount.
 
-That is what makes the routing problem interesting to me. The graph tells you where a trade can go, but the state tells you where it should go.
+## Correctness Validation
+
+One of the main goals of the project is to make the local simulation agree with real on-chain reserve transitions.
+
+The current end-to-end validation produced:
+
+```text
+Simulated output: 552782643753440975662
+Actual output:    552782643753440975662
+Perfect match: simulation == on-chain execution.
+```
+
+This is an important milestone because the routing engine is not useful if its local reserve model diverges from the execution semantics of the contracts.
+
+For the tested pool topology and execution plan, the simulation reproduced the same final output as the actual transaction.
+
+## Local Test Topology
+
+The current local setup uses three ERC-20 test tokens and four AMM pools:
+
+```text
+Token A <----> Token B
+   |              |
+   |              |
+   +---- AMM3     +---- AMM4
+   |              |
+   v              v
+Token C <---------+
+```
+
+More precisely:
+
+```text
+AMM1: Token A / Token B
+AMM2: Token A / Token B
+AMM3: Token A / Token C
+AMM4: Token B / Token C
+```
+
+This topology is intentionally useful for testing both:
+
+```text
+parallel liquidity
+A -> B via AMM1
+A -> B via AMM2
+```
+
+and:
+
+```text
+shared downstream liquidity
+AMM1 -> AMM4
+AMM2 -> AMM4
+```
+
+The setup script deploys the test tokens, AMMs, registry and aggregator, configures the approved pools, seeds liquidity and funds a local trader account.
+
+## Solidity Components
+
+The on-chain side currently contains:
+
+```text
+src/
+├── aggregator/
+│   └── QuoteAggregator.sol
+├── amm/
+│   └── AMMPool.sol
+├── interfaces/
+│   └── IAMMPool.sol
+├── pool_registry/
+│   └── PoolRegistry.sol
+└── tokens/
+    ├── TokenA.sol
+    ├── TokenB.sol
+    └── TokenC.sol
+```
+
+### `AMMPool`
+
+The test AMM implements:
+
+- constant-product style quoting
+- 0.3% swap fee
+- two-token liquidity pools
+- reserve synchronization
+- liquidity add/remove operations
+- swaps in either token direction
+
+The swap implementation measures the actual input token amount received by the pool before calculating output, which keeps the reserve update tied to what the pool actually received.
+
+### `QuoteAggregator`
+
+The aggregator contract provides:
+
+- candidate route quote evaluation
+- route quote calculation
+- generic execution steps
+- approved-target validation
+- atomic execution
+- final output/slippage verification
+- execution events
+
+### `PoolRegistry`
+
+A simple owner-controlled allowlist of approved execution pools.
+
+### Test Tokens
+
+Three local ERC-20 tokens provide a deterministic environment for developing and validating the router.
+
+## Development Workflow
+
+The repository is designed around a local Foundry/Anvil environment and a Rust CLI.
+
+Build the Solidity project with:
+
+```bash
+forge build
+```
+
+Run Solidity formatting and tests with:
+
+```bash
+forge fmt --check
+forge test -vvv
+```
+
+Check the Rust project with:
+
+```bash
+cd aggregator
+cargo check
+```
+
+Run Rust tests with:
+
+```bash
+cargo test
+```
+
+Start a local Anvil node:
+
+```bash
+anvil
+```
+
+Then deploy the local environment:
+
+```bash
+./script/setup_local.sh
+```
+
+The setup script deploys the contracts through `Setup.s.sol` and writes the local addresses and trader key to `.env.local`.
+
+The router itself can then be invoked with:
+
+```bash
+cd aggregator
+
+cargo run -- \
+  --in-token <INPUT_TOKEN_ADDRESS> \
+  --out-token <OUTPUT_TOKEN_ADDRESS> \
+  --amount-in <AMOUNT_IN_BASE_UNITS>
+```
+
+The RPC URL can be supplied through the CLI or `RPC_URL` environment variable.
+
+## Engineering Decisions
+
+### Keep routing off-chain
+
+The expensive search, quoting, cloning and split simulation happen in Rust rather than inside the EVM.
+
+That makes it practical to explore more candidate paths without paying on-chain computation costs for every hypothetical route.
+
+### Keep execution generic
+
+The Solidity executor does not contain the routing algorithm.
+
+Rust decides:
+
+```text
+which route
+which pool
+which amount
+which order
+which calldata
+```
+
+Solidity is responsible for:
+
+```text
+authorization
+execution
+atomicity
+minimum-output enforcement
+```
+
+This separation allows routing logic to evolve without redesigning the complete execution layer.
+
+### Model shared pools by physical identity
+
+The simulator identifies shared liquidity through the pool address rather than treating every directional graph edge as a different pool.
+
+That is important because:
+
+```text
+A -> B via AMM1
+B -> A via AMM1
+```
+
+are two graph views of one liquidity source.
+
+### Replay the chosen order when building calldata
+
+The allocator's result is an ordered plan, not just a set of percentages.
+
+The execution builder replays that exact order while updating the same simulated pool state, which keeps the generated hop inputs consistent with the state assumed by the allocator.
+
+## Current Limitations
+
+This is an engineering prototype and several components are intentionally simplified.
+
+### Allocation
+
+The current split algorithm is greedy and chunk-based.
+
+It does not guarantee the globally optimal split across all available routes.
+
+### Gas model
+
+Gas estimates are coarse constants rather than measured execution costs for the complete generated plan.
+
+### Route search
+
+Candidate routes are discovered with bounded DFS. A production-scale router would need stronger pruning, caching, topology management and more scalable candidate generation.
+
+### DEX coverage
+
+The current contracts model a single test AMM interface. The project does not yet integrate multiple production DEX protocols with different pool and swap interfaces.
+
+### Pool discovery
+
+The current setup uses configured pool addresses. There is no production indexing/discovery system that continuously discovers new pools and updates the routing graph.
+
+### Slippage
+
+Slippage handling is intentionally simple and aimed at correctness testing rather than production execution policy.
+
+### Execution optimization
+
+The current execution representation can be improved to reduce unnecessary calldata and execution overhead, especially when the allocator produces many small chunks.
+
+### Reliability under rapidly changing chain state
+
+The current simulation starts from synchronized reserves but does not yet provide a sophisticated mechanism for protecting against all forms of state change between synchronization and transaction mining.
+
+## Future Work
+
+The project is still ongoing. The areas I want to develop next include:
+
+- stronger global split optimization
+- gas-aware allocation and execution ordering
+- more efficient shared-pool state indexing
+- route pruning and caching
+- execution-plan compression
+- realistic gas estimation
+- generic adapters for multiple DEX designs
+- broader pool discovery and indexing
+- stronger target and calldata validation
+- better slippage modeling
+- fuzzing and invariant testing across routing and execution
+- larger topology and performance benchmarks
+
+## Project Goal
+
+The goal is to build a routing engine that demonstrates the systems problem behind DEX aggregation:
+
+```text
+pool state
+    |
+    v
+route discovery
+    |
+    v
+AMM quoting
+    |
+    v
+shared-liquidity simulation
+    |
+    v
+split allocation
+    |
+    v
+ordered execution plan
+    |
+    v
+ABI encoding
+    |
+    v
+atomic on-chain execution
+    |
+    v
+simulation vs actual result
+```
+
+The current implementation is deliberately small enough to reason about end to end, while leaving the main optimization and productionization problems open for further work.
