@@ -1,6 +1,7 @@
 ---
 title: DEX Aggregator
-summary: Building a DEX routing system with pool state, graph-based route discovery, split allocation, and atomic on-chain execution.role: Independent Project
+summary: Building a DEX routing system with pool state, graph-based route discovery, split allocation, and atomic on-chain execution
+role: Independent Project
 date: 2026-09-08
 dateLabel: Ongoing
 tags: [Rust, Solidity, Ethereum, DeFi, DEX, AMM, Routing, Alloy, Foundry, Tokio, Blockchain]
