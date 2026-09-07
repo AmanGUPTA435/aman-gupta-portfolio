@@ -4,7 +4,7 @@ export const SITE = {
   name: 'Aman Gupta',
   role: 'Rust Backend Engineer · Blockchain Infrastructure · Web3',
   email: 'amangupta432005@gmail.com',
-  tagline: 'Rust backend engineer working on blockchain infrastructure and distributed systems.',
+  tagline: 'Backend and blockchain engineer working with Rust, blockchain infrastructure, DeFi and smart contracts.',
   description:
     'Engineering portfolio of Aman Gupta, focused on Rust backend engineering, blockchain infrastructure, distributed systems, and Web3 backend systems.',
   status: 'Open to full-time and freelance opportunities',
